@@ -6,9 +6,11 @@ rust-version = "1.75"
 description = "Zig progress protocol client library for Rust"
 license = "CC0-1.0"
 repository = "https://github.com/asciimoth/zprs"
+documentation = "https://docs.rs/zprs"
 readme = "README.md"
-
-[dependencies]
+keywords = ["zig", "progress", "cli", "subprocess", "protocol"]
+categories = ["command-line-interface"]
+include = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

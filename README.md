@@ -97,7 +97,7 @@ cargo build --example demo
 zpg target/debug/examples/demo
 ```
 
-The [combined example](examples/demo.rs) starts a `zpg --mock` child process and
+The [combined example][demo] starts a `zpg --mock` child process and
 forks a Rust worker. The parent combines both task trees under `Rust demo`.
 Both workers also write messages to standard output and standard error. This
 example requires Unix and `zpg` on `PATH`.
@@ -156,7 +156,7 @@ reporters in the process tree.
 
 `unsafe Node::fork()` returns `ForkResult::Parent { pid }` in the parent and
 `ForkResult::Child { channel }` in the child. See the complete
-[fork example](examples/fork.rs).
+[fork example][fork].
 
 The method stops and joins all of this library's update threads before the fork
 and restarts them in the parent. In the child, it disables inherited reporters,
@@ -229,7 +229,7 @@ If you use manual updates, call `flush()` regularly to collect child reports.
 | `unsafe Node::fork()` | Fork with a private channel on Unix |
 
 Task operations are thread-safe. For full signatures, see the
-[reporter API source](src/reporter.rs) and the [Unix API source](src/unix.rs).
+[API documentation](https://docs.rs/zprs).
 
 ## Technical details
 
@@ -284,6 +284,8 @@ The reporter handles a closed receiver without changing the process-wide
 [issues]: https://github.com/asciimoth/zprs/issues
 [pulls]: https://github.com/asciimoth/zprs/pulls
 [topic]: https://github.com/topics/zig-progress-protocol
+[demo]: https://github.com/asciimoth/zprs/blob/master/examples/demo.rs
+[fork]: https://github.com/asciimoth/zprs/blob/master/examples/fork.rs
 
 ## License
 

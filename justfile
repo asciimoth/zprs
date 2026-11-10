@@ -63,6 +63,13 @@ check-nix:
 doc:
     cargo doc --frozen --no-deps
 
+# Check the release package without uploading it. Commit changes first.
+release-check: check-rust
+    cargo fmt --all -- --check
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+    cargo package --list --locked
+    cargo publish --dry-run --locked
+
 # Create a commit with a Conventional Commits message.
 commit:
     cz commit
