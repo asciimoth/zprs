@@ -1,2 +1,3 @@
 # zprs
-Zig progress protocol client library for rust
+
+Zig progress protocol client library for Rust.

@@ -1,0 +1,11 @@
+[package]
+name = "zprs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Zig progress protocol client library for Rust"
+license = "CC0-1.0"
+repository = "https://github.com/asciimoth/zprs"
+readme = "README.md"
+
+[dependencies]

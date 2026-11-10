@@ -1,0 +1,11 @@
+commitizen:
+  name: cz_customize
+  customize:
+    schema: "<type>(<scope>)?: <message>"
+    schema_pattern: '^(?:bump|feat|fix|perf|refactor|docs|style|test|chore|dev|build|ci|revert|other)(?:\([A-Za-z0-9_./-]+\))?(!)?:\s[^\r\n]+(?:\r?\n[\s\S]*)?$'
+    example: "feat(client): add progress updates"
+    message_template: "{{message}}"
+    questions:
+      - type: input
+        name: message
+        message: "Commit message (type(scope): message):"
