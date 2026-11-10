@@ -131,7 +131,16 @@
               commitizen.enable = true;
               deadnix.enable = true;
               end-of-file-fixer.enable = true;
-              markdownlint.enable = true;
+              markdownlint = {
+                enable = true;
+                settings.configuration.MD033.allowed_elements = [
+                  "p"
+                  "a"
+                  "img"
+                  "br"
+                  "span"
+                ];
+              };
               nixfmt.enable = true;
               statix.enable = true;
               trim-trailing-whitespace.enable = true;

@@ -1,27 +1,63 @@
 # zprs
 
-`zprs` is a Rust client for the Zig progress protocol. It reports tasks,
-subtasks, and child process progress to a supervisor such as
-[`zpg`](https://github.com/asciimoth/zpg). It does not draw a terminal display.
+`zprs` is a Rust library that reports task progress through the Zig progress
+protocol. Use it to report tasks, subtasks, and progress from child processes.
 
-Requires Rust 1.75 or later. Pipe transport and fork support are available on
-Unix. On other platforms, reporting is disabled and subprocesses still run.
-The only runtime dependency is `libc`, on Unix.
+`zprs` requires Rust 1.75 or later. Pipe reporting and fork support are available
+on Unix. On other platforms, reporting is disabled and child processes still
+run. On Unix, the only runtime dependency is `libc`.
 
-## Report tasks
+## Installation
 
-Add `zprs = "0.1"` to your dependencies, then create one reporter per upstream
-channel:
+Add `zprs` to the dependencies in your `Cargo.toml`:
+
+```toml
+[dependencies]
+zprs = "0.1"
+```
+
+## Zig progress protocol
+
+The Zig progress protocol sends a task tree from a child process to its
+parent through a pipe. Tasks have names, completed item counts, and estimated
+totals. The `ZIG_PROGRESS` environment variable gives the pipe descriptor.
+A parent can combine task trees from its children into one progress display.
+
+The protocol also works outside the Zig toolchain. For example,
+[`zpg`][zpg] can run your Rust program and display its progress in a terminal.
+Use `zprs` to send reports to `zpg` or another compatible receiver.
+
+See Andrew Kelley's [protocol specification][spec] for the protocol design.
+For clients in other languages, see [`zppy`][zppy] for Python and
+[`zpgo`][zpgo] for Go.
+
+![zpg displaying a task tree](https://raw.githubusercontent.com/asciimoth/zpg/master/demo.gif)
+
+## Library usage
+
+If you use this library, [open an issue][issues] or [send a pull request][pulls]
+with a link to your project. This helps us track use of the Zig progress
+protocol outside the Zig toolchain.
+
+Add the [`zig-progress-protocol` topic][topic] to your GitHub repository. Use
+the same tag on other platforms so people can find related projects.
+
+### Report tasks
+
+Save this example as `src/main.rs` in your Cargo project:
 
 ```rust
+use std::thread;
+use std::time::Duration;
 use zprs::Progress;
 
-fn build() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     let progress = Progress::new("build", 2)?;
     for name in ["assets", "code"] {
         let task = progress.root().start(name, 10);
         for _ in 0..10 {
-            // Do one item of work.
+            // Replace this delay with one item of work.
+            thread::sleep(Duration::from_millis(100));
             task.complete_one();
         }
     } // Each task ends when its last handle is dropped.
@@ -29,20 +65,44 @@ fn build() -> std::io::Result<()> {
 }
 ```
 
-Run your program with `zpg ./your-program`. Without a usable `ZIG_PROGRESS`
-channel, task operations have no effect. The library does not write to standard
-output or standard error.
+With `zpg` on `PATH`, build and run your program. Replace `your-program` with
+your Cargo binary name:
 
-A `Node` is a shared task handle. Clone it to share a task between threads.
-Dropping its last handle, or calling `end()`, removes the task and its descendants
-and completes **one** item in its parent. Do not also increment the parent for
-that task. Repeated `end()` calls and updates on ended nodes have no effect.
+```sh
+cargo build
+zpg target/debug/your-program
+```
+
+If no usable `ZIG_PROGRESS` channel is available, reporting is disabled.
+Task updates then have no effect. The library does not write to standard
+output or standard error. It does not draw its own terminal display.
+
+A task can start child tasks. A `Node` is a shared task handle. Clone the handle
+to share a task between threads.
+When the last handle is dropped, the task and its descendants are removed.
+Calling `end()` also removes the task and its descendants. Either action
+completes one item in the parent task. Do not also increment the parent count
+for that task. Repeated `end()` calls and updates on ended tasks have no effect.
 Ending a task does not indicate success or failure.
 
 Dropping a root handle has no effect. Ending the root closes the reporter.
 Dropping `Progress` also closes the reporter, even if task handles remain.
 
-## Subprocesses
+### Run the combined example
+
+From the root directory of this repository, run:
+
+```sh
+cargo build --example demo
+zpg target/debug/examples/demo
+```
+
+The [combined example](examples/demo.rs) starts a `zpg --mock` child process and
+forks a Rust worker. The parent combines both task trees under `Rust demo`.
+Both workers also write messages to standard output and standard error. This
+example requires Unix and `zpg` on `PATH`.
+
+### Child processes
 
 Configure a standard `Command`, then pass it to `Node::spawn`:
 
@@ -64,28 +124,35 @@ fn run() -> std::io::Result<()> {
 }
 ```
 
-`spawn` returns a normal `std::process::Child`. It preserves arguments, standard
-streams, working directory, and other environment settings, including
-`env_clear()`. It consumes the command because its exec hook owns the private
-pipe descriptor. Custom exec hooks must not call this library or change that
-private descriptor. The parent environment stays unchanged.
+Replace `worker` and its arguments with your command. In a Rust worker, create
+a new reporter with `Progress::new`. Workers in other languages can use any
+client with the same protocol format.
 
-The child's root replaces the task in each report. Its descendants appear below
-that task. An empty child root name keeps the local task name. Before the first
-complete child report, the task keeps its local values. After EOF or an invalid
-child report, the last valid child tree remains until the task ends.
+`spawn` returns a `std::process::Child`. The method preserves the command's
+arguments, standard streams, working directory, and other environment settings,
+including `env_clear()`. It sets `ZIG_PROGRESS` in the child environment to
+identify the private progress pipe. The parent environment stays unchanged.
+The method consumes the command. Custom exec hooks must not call this library
+or change the private progress pipe descriptor.
+
+The child process's root replaces the task in each report. The root's
+descendants appear below that task. If the child root name is empty, the task
+keeps its local name. Before the first complete child report, the task keeps
+its local values. After the pipe reaches end-of-file (EOF) or receives an
+invalid child report, the last valid child tree remains until the task ends.
 
 Use one task per process. A second attachment to the same active task returns
-`InvalidInput`, even after the first process exits. A failed spawn leaves the
-task available. Disabled, ended, or closed tasks still spawn processes, with
-`ZIG_PROGRESS` removed from the child environment.
+`InvalidInput`, even after the first process exits. If `spawn` fails, the task
+remains available. Disabled, ended, or closed tasks still start child processes.
+For these tasks, `ZIG_PROGRESS` is removed from the child environment.
 
-Wait for the child, then end its task. Ending a task or closing a reporter closes
-its progress pipes. Neither action waits for or terminates the process. Children
-can use this library or any other client with the same wire format, and can
-start their own children.
+Wait for the child process, then end its task. Ending a task closes the task's
+progress pipes. Closing a reporter closes the reporter's progress pipes.
+Neither action waits for or terminates the process. Child processes can start
+their own child processes. Use the same `name_size` for the receiver and all
+reporters in the process tree.
 
-## Forks on Unix
+### Forked processes on Unix
 
 `unsafe Node::fork()` returns `ForkResult::Parent { pid }` in the parent and
 `ForkResult::Child { channel }` in the child. See the complete
@@ -93,48 +160,61 @@ start their own children.
 
 The method stops and joins all of this library's update threads before the fork
 and restarts them in the parent. In the child, it disables inherited reporters,
-closes their owned pipes, and removes `ZIG_PROGRESS`. Create a fresh reporter
-with `Options::build_with_fd(channel.as_fd())`. The returned channel is owned by
-the caller; close it after the new reporter duplicates it. If the source task
-was disabled or ended, `channel` is `None`; create a disabled reporter.
+closes the pipes they own, and removes `ZIG_PROGRESS`. Create a new reporter
+with `Options::build_with_fd(channel.as_fd())`. The caller owns the returned
+channel. Close the channel after the new reporter duplicates it. If the source
+task was disabled or ended, `channel` is `None`. In that case, create a disabled
+reporter.
 
 The caller must ensure that no other application threads exist at the fork.
 Signal handlers and at-fork hooks must not call this library. Other libraries
 must permit execution after fork. Use `spawn` in multithreaded applications.
-Caller-owned descriptors remain the caller's responsibility in both processes.
+The caller must manage caller-owned descriptors in both processes.
 Close the child's reporter before calling `_exit`, which skips destructors.
 The parent must reap the PID with `waitpid`, then end the task.
 
 A direct `libc::fork()` does not attach a private progress channel. Inherited
 reporter handles detect the changed PID and do not report or join old threads.
-Do not create a new reporter from the inherited upstream channel after a raw
-fork: two writers can corrupt the stream.
+After a direct `libc::fork()`, do not create a new reporter from the inherited
+upstream channel. Two writers can corrupt the stream.
 
-## Settings and API
+### Settings and API
 
-Use `Options { ..Options::new("build", 10) }.build()` to configure a reporter.
-On Unix, `build_with_fd(BorrowedFd)` accepts an explicit writable pipe. It returns
-an error for an unusable descriptor. The caller keeps the original descriptor;
-the reporter owns a duplicate. Nonblocking mode is shared by both descriptors.
-An invalid environment channel instead disables reporting without an error.
+Use `Options` to configure a reporter:
+
+```rust
+use zprs::Options;
+
+fn main() -> std::io::Result<()> {
+    let progress = Options {
+        refresh_interval: None,
+        ..Options::new("build", 10)
+    }
+    .build()?;
+
+    // Do work and call progress.flush() regularly to send updates.
+    progress.flush()?;
+    progress.close()
+}
+```
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `root_name` | Empty | Root label |
+| `root_name` | Empty | Root name |
 | `estimated_total_items` | `0` | Root estimate; zero means unknown |
-| `refresh_interval` | `Some(80 ms)` | Update interval; `None` for manual |
+| `refresh_interval` | `Some(80 ms)` | Update period; `None` for manual use |
 | `initial_delay` | `200 ms` | Delay before the first automatic report |
 | `disabled` | `false` | Disable reporting |
 | `name_size` | `NameSize::Current` | 120-byte name field |
 
 A zero update interval or a duration that cannot fit an `Instant` is invalid.
-Manual reporters must call `flush()` regularly to collect child reports.
+If you use manual updates, call `flush()` regularly to collect child reports.
 
 | Method | Action |
 | --- | --- |
 | `Progress::root()` | Get a root handle |
 | `Progress::enabled()` | Check whether the channel is open |
-| `Progress::flush()` | Collect children and try to send the current tree |
+| `Progress::flush()` | Collect child reports and try to send the current tree |
 | `Progress::error()` | Get the first permanent output error |
 | `Progress::close()` | Stop updates, try a final report, and close pipes |
 | `Node::start(name, total)` | Start a child task |
@@ -143,72 +223,83 @@ Manual reporters must call `flush()` regularly to collect child reports.
 | `Node::set_completed_items(count)` | Set the completed count |
 | `Node::set_estimated_total_items(count)` | Set the estimate |
 | `Node::increase_estimated_total_items(count)` | Add to the estimate |
-| `Node::set_name(name)` | Change the label |
+| `Node::set_name(name)` | Change the task name |
 | `Node::end()` | Remove this branch and complete one parent item |
-| `Node::spawn(command)` | Start a subprocess with a private channel |
+| `Node::spawn(command)` | Start a child process with a private channel |
 | `unsafe Node::fork()` | Fork with a private channel on Unix |
 
-Task operations are thread-safe. Counters saturate at `u32::MAX` for completed
-items and `u32::MAX - 1` for totals. Names stop at the first NUL. They are
-shortened at a UTF-8 character boundary and padded with zero bytes. A tree has
-at most 253 nodes, including the root. At capacity, `start()` returns a
-disabled handle. Local tasks have priority when merged child trees exceed this
-limit.
+Task operations are thread-safe. For full signatures, see the
+[reporter API source](src/reporter.rs) and the [Unix API source](src/unix.rs).
 
-`flush()` returns `Ok(true)` when the current snapshot was sent in full,
-`Ok(false)` when disabled or blocked, and an error for permanent output failure.
-Writes do not wait for pipe space. A partially written packet is completed before
-a newer packet is sent. Closing is best effort: if the pipe stays full, the last
-packet can remain incomplete. Close does not set counts to their estimates.
+## Technical details
+
+### Protocol compatibility and limits
+
+Names use 120 bytes by default. Select `NameSize::Legacy` for the 40-byte
+format in the [published specification][spec]. The two formats are not wire
+compatible. The protocol does not negotiate the format. The receiver and every
+reporter in a process tree must use the same setting.
+
+Use one reporter per output pipe. Each report replaces the previous task tree.
+Multiple writers can replace each other's progress or mix packet bytes. Use
+`Node::spawn()` or `Node::fork()` to combine progress from separate processes
+through private pipes.
+
+Completed counts are limited to `u32::MAX`. Totals are limited to
+`u32::MAX - 1`. The library reduces larger values to these limits. Names stop
+at the first NUL. The library shortens names at a UTF-8 character boundary and
+pads them with zero bytes. A tree has at most 253 nodes, including the root.
+When the tree reaches this limit, `start()` returns a disabled handle. Ending
+tasks makes space for new tasks. Local tasks have priority when combined child
+trees exceed this limit.
+
+### Platforms and pipe handling
+
+Pipe reporting and `Node::fork()` are available on Unix. On other platforms,
+reporting is disabled and `Node::spawn()` still starts processes.
+
+On Unix, `Options::build_with_fd(BorrowedFd)` accepts an explicit writable pipe.
+It returns an error for an unusable descriptor unless reporting is disabled.
+The caller keeps the original descriptor. The reporter owns a duplicate.
+Both descriptors share nonblocking mode. If the channel specified by
+`ZIG_PROGRESS` is invalid, reporting is disabled without an error.
+
+`flush()` returns one of these results:
+
+- `Ok(true)` if the current snapshot was sent in full.
+- `Ok(false)` if reporting is disabled or blocked.
+- An error if a permanent output failure occurs.
+
+Writes do not wait for pipe space. The reporter completes a partially written
+packet before it sends a newer packet. When the reporter closes, it tries to
+complete the last packet. If the pipe stays full, that packet can remain
+incomplete. Closing the reporter does not set counts to their estimates.
 The reporter handles a closed receiver without changing the process-wide
 `SIGPIPE` handler.
 
-## Wire compatibility
-
-The [published protocol specification][spec] uses 40-byte task names.
-The [current Zig standard library][zig] and current `zpg` use 120-byte names.
-Select `NameSize::Legacy` for the published format and older Zig versions.
-There is no format negotiation; the supervisor and every reporter in a process
-tree must use the same setting.
-
-Reports contain a node count, little-endian counters and fixed-size names, then
-one parent byte per node. Child trees are checked for invalid parents, cycles,
-reserved values, and truncated packets. The implementation also uses
-[`zppy`](https://github.com/asciimoth/zppy) and
-[`zpgo`](https://github.com/asciimoth/zpgo) as behavioral references.
-
 [spec]: https://andrewkelley.me/post/zig-new-cli-progress-bar-explained.html#the-zig-progress-protocol-specification
-[zig]: https://codeberg.org/ziglang/zig/src/branch/master/lib/std/Progress.zig
+[zpg]: https://github.com/asciimoth/zpg
+[zppy]: https://github.com/asciimoth/zppy
+[zpgo]: https://github.com/asciimoth/zpgo
+[issues]: https://github.com/asciimoth/zprs/issues
+[pulls]: https://github.com/asciimoth/zprs/pulls
+[topic]: https://github.com/topics/zig-progress-protocol
 
-## Examples and tests
+## License
 
-```sh
-just run
-just run fork
-cargo build --examples
-zpg target/debug/examples/demo
-zpg target/debug/examples/fork
-cargo test --frozen
-cargo clippy --frozen --all-targets --all-features -- -D warnings
-cargo doc --frozen --no-deps
-```
+Files in this repository are distributed under the CC0 license.
 
-`just run` builds the demo and runs it under the `zpg` tree renderer. On Unix,
-the demo starts a `zpg --mock` subprocess and forks a Rust worker without exec.
-The parent collects both progress trees and sends the merged tree to the
-supervisor. Each task ends when its child exits. `just run fork` runs the
-separate example with only a forked Rust worker.
-
-Tests cover both wire formats, malformed child streams, partial writes,
-backpressure, task lifetimes, capacity, concurrent updates, standard process
-settings, descriptor ownership, forks, nested process trees, and signal handling.
-Process fixtures run in separate executables so fork tests do not run inside
-libtest's thread pool. Every process test has a timeout.
-
-Compatibility tests run `zpg --test`, check its independent packet validator,
-and inspect the merged tree. They run when `zpg` is on `PATH`; otherwise they
-print a skip message. Set `ZPRS_REQUIRE_ZPG=1` to make its absence an error.
-The Nix development shell provides `zpg`. Use `just test-min` to test Rust 1.75
-and `just check-nix` for sandboxed checks with both Rust toolchains.
-
-The project uses the [CC0-1.0 license](LICENSE).
+<p xmlns:dct="http://purl.org/dc/terms/">
+  <a rel="license"
+     href="https://creativecommons.org/publicdomain/zero/1.0/">
+    <img src="https://i.creativecommons.org/p/zero/1.0/88x31.png"
+         style="border-style: none;" alt="CC0" />
+  </a>
+  <br />
+  To the extent possible under law,
+  <a rel="dct:publisher"
+     href="https://github.com/asciimoth">
+    <span property="dct:title">ASCIIMoth</span></a>
+  has waived all copyright and related or neighboring rights to
+  <span property="dct:title">zprs</span>.
+</p>
