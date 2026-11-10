@@ -5,11 +5,35 @@ mod suite {
     use std::fs::File;
     use std::io::{self, Read};
     use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Output, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
     use zprs::{ForkResult, NameSize, Node, Options};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            for attempt in 0..1000 {
+                let path =
+                    std::env::temp_dir().join(format!("zprs-{}-{attempt}", std::process::id()));
+                match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => return Self(path),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("cannot create test directory: {e}"),
+                }
+            }
+            panic!("cannot find an unused test directory");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn options(name: &str) -> Options {
         Options {
@@ -477,14 +501,56 @@ mod suite {
                 assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
                 assert!(!options("disabled").build().unwrap().enabled());
             }
-            "sigpipe" => {
+            "sigpipe" | "sigpipe-ignored" | "sigpipe-pending" | "sigpipe-blocked" => {
                 let (reader, writer) = pipe();
                 drop(reader);
                 let p = options("broken").build_with_fd(writer.as_fd()).unwrap();
                 unsafe {
-                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                    let handler = if mode == "sigpipe-ignored" {
+                        libc::SIG_IGN
+                    } else {
+                        libc::SIG_DFL
+                    };
+                    assert_ne!(libc::signal(libc::SIGPIPE, handler), libc::SIG_ERR);
+                    let mut set = std::mem::zeroed::<libc::sigset_t>();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGPIPE);
+                    let blocked = matches!(mode, "sigpipe-pending" | "sigpipe-blocked");
+                    assert_eq!(
+                        libc::pthread_sigmask(
+                            if blocked {
+                                libc::SIG_BLOCK
+                            } else {
+                                libc::SIG_UNBLOCK
+                            },
+                            &set,
+                            std::ptr::null_mut(),
+                        ),
+                        0
+                    );
+                    if mode == "sigpipe-pending" {
+                        assert_eq!(libc::raise(libc::SIGPIPE), 0);
+                    }
+                    assert_eq!(p.flush().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+                    let mut pending = std::mem::zeroed::<libc::sigset_t>();
+                    assert_eq!(libc::sigpending(&mut pending), 0);
+                    assert_eq!(
+                        libc::sigismember(&pending, libc::SIGPIPE),
+                        i32::from(mode == "sigpipe-pending")
+                    );
+                    let mut mask = std::mem::zeroed::<libc::sigset_t>();
+                    assert_eq!(
+                        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask),
+                        0
+                    );
+                    assert_eq!(libc::sigismember(&mask, libc::SIGPIPE), i32::from(blocked));
+                    if mode == "sigpipe-pending" {
+                        let mut signal = 0;
+                        assert_eq!(libc::sigwait(&set, &mut signal), 0);
+                        assert_eq!(signal, libc::SIGPIPE);
+                    }
+                    assert_eq!(libc::signal(libc::SIGPIPE, handler), handler);
                 }
-                assert_eq!(p.flush().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
                 assert!(!p.enabled());
             }
             "closed-stdio" => {
@@ -540,6 +606,49 @@ mod suite {
                 assert!(child.try_wait().unwrap().is_none());
                 child.kill().unwrap();
                 assert!(!child.wait().unwrap().success());
+            }
+            "pipe-failures" => {
+                let p = Options {
+                    initial_delay: Duration::ZERO,
+                    refresh_interval: Some(Duration::from_millis(5)),
+                    ..options("before pipe failure")
+                }
+                .build()
+                .unwrap();
+                let task = p.root().start("child", 0);
+                // Limit this fixture only. Existing descriptors stay open, but
+                // pipe creation must fail. Restore the limit before assertions.
+                let mut original = unsafe { std::mem::zeroed::<libc::rlimit>() };
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+                    0
+                );
+                let limited = libc::rlimit {
+                    rlim_cur: 0,
+                    ..original
+                };
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limited) }, 0);
+                let spawn = task.spawn(worker_command("leaf"));
+                // No application threads exist; fork must restart the reporter
+                // thread after the pipe error without creating a process.
+                let fork = unsafe { task.fork() };
+                assert_eq!(
+                    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+                    0
+                );
+                assert_eq!(spawn.unwrap_err().raw_os_error(), Some(libc::EMFILE));
+                assert_eq!(fork.unwrap_err().raw_os_error(), Some(libc::EMFILE));
+                p.root().set_name("after pipe failure");
+                thread::sleep(Duration::from_millis(40));
+                assert!(p.enabled());
+                assert!(p.error().is_none());
+                assert!(task
+                    .spawn(worker_command("leaf"))
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .success());
+                p.close().unwrap();
             }
             "exit-23" => std::process::exit(23),
             "sleep" => thread::sleep(Duration::from_secs(30)),
@@ -611,10 +720,19 @@ mod suite {
     }
 
     fn resources() {
-        for mode in ["resources", "closed-stdio"] {
+        for mode in ["resources", "closed-stdio", "pipe-failures"] {
             let reports = frames(&capture(mode).0, 120);
             if mode == "closed-stdio" {
                 assert_eq!(reports[0][1].name, "leaf");
+            } else if mode == "pipe-failures" {
+                assert!(
+                    reports
+                        .iter()
+                        .filter(|f| f[0].name == "after pipe failure")
+                        .count()
+                        >= 2
+                );
+                assert_eq!(reports.last().unwrap()[1].name, "leaf");
             }
         }
     }
@@ -662,18 +780,27 @@ mod suite {
             });
         }
         assert!(wait(command.spawn().unwrap()).status.success());
-        assert!(wait(worker_command("sigpipe").spawn().unwrap())
-            .status
-            .success());
+        for mode in [
+            "sigpipe",
+            "sigpipe-ignored",
+            "sigpipe-pending",
+            "sigpipe-blocked",
+        ] {
+            assert!(
+                wait(worker_command(mode).spawn().unwrap()).status.success(),
+                "{mode}"
+            );
+        }
     }
     fn zpg() {
-        if Command::new("zpg")
+        let probe = Command::new("zpg")
             .arg("--help")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
+            .spawn();
+        if let Ok(child) = probe {
+            assert!(wait(child).status.success(), "zpg --help failed");
+        } else {
             assert!(
                 std::env::var_os("ZPRS_REQUIRE_ZPG").is_none(),
                 "zpg required but unavailable"
@@ -683,6 +810,7 @@ mod suite {
             );
             return;
         }
+        let directory = TempDir::new();
         for mode in [
             "basic",
             "spawn",
@@ -692,8 +820,7 @@ mod suite {
             "max",
             "auto",
         ] {
-            let log_path =
-                std::env::temp_dir().join(format!("zprs-{}-{mode}.log", std::process::id()));
+            let log_path = directory.0.join(format!("{mode}.log"));
             let mut command = Command::new("zpg");
             command
                 .args(["--test", "--test-output"])

@@ -129,3 +129,47 @@ fn arbitrary_packets_never_panic_or_produce_invalid_trees() {
         }
     }
 }
+
+#[test]
+fn all_small_parent_graphs_are_checked_and_remapped() {
+    // Exhaustive small graphs cover cycles and forward references that random
+    // packets rarely reach because their root or length is usually invalid.
+    for size in [NameSize::Legacy, NameSize::Current] {
+        for count in 1usize..=5 {
+            let choices: Vec<_> = (0..=count as u8).chain([254, 255]).collect();
+            for mut pattern in 0..choices.len().pow((count - 1) as u32) {
+                let mut records = vec![record(255, b"root")];
+                for i in 1..count {
+                    records.push(record(choices[pattern % choices.len()], &[b'a' + i as u8]));
+                    pattern /= choices.len();
+                }
+                // Independently follow each node's parent chain to the root.
+                let valid = (1..count).all(|start| {
+                    let mut node = start;
+                    for _ in 0..count {
+                        if node == 0 {
+                            return true;
+                        }
+                        let Some(r) = records.get(node) else {
+                            return false;
+                        };
+                        node = usize::from(r.parent);
+                    }
+                    false
+                });
+                let decoded = decode(&encode(&records, size), size);
+                assert_eq!(decoded.is_some(), valid, "{records:?}");
+                if let Some(decoded) = decoded {
+                    for (index, r) in decoded.iter().enumerate().skip(1) {
+                        assert!(usize::from(r.parent) < index);
+                        let original = records.iter().find(|old| old.name == r.name).unwrap();
+                        assert_eq!(
+                            decoded[usize::from(r.parent)].name,
+                            records[usize::from(original.parent)].name
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
