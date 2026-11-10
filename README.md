@@ -31,8 +31,8 @@ The protocol also works outside the Zig toolchain. For example,
 Use `zprs` to send reports to `zpg` or another compatible receiver.
 
 See Andrew Kelley's [protocol specification][spec] for the protocol design.
-For clients in other languages, see [`zppy`][zppy] for Python and
-[`zpgo`][zpgo] for Go.
+For clients in other languages, see [`zppy`][zppy] for Python,
+[`zpgo`][zpgo] for Go, and [`zpjs`][zpjs] for JavaScript.
 
 ![zpg displaying a task tree](https://raw.githubusercontent.com/asciimoth/zpg/master/demo.gif)
 
@@ -284,6 +284,7 @@ The reporter handles a closed receiver without changing the process-wide
 [zpg]: https://github.com/asciimoth/zpg
 [zppy]: https://github.com/asciimoth/zppy
 [zpgo]: https://github.com/asciimoth/zpgo
+[zpjs]: https://github.com/asciimoth/zpjs
 [issues]: https://github.com/asciimoth/zprs/issues
 [pulls]: https://github.com/asciimoth/zprs/pulls
 [topic]: https://github.com/topics/zig-progress-protocol
