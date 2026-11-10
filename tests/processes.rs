@@ -62,43 +62,92 @@ mod suite {
         }
         unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
     }
-    fn collect(child: &mut Child, reader: &mut File) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut data = Vec::new();
-        loop {
-            let mut buffer = [0; 65536];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => data.extend_from_slice(&buffer[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => panic!("{e}"),
-                }
-            }
-            if child.try_wait().unwrap().is_some() {
-                // Drain once more after the final process write.
-                let _ = reader.read_to_end(&mut data);
-                return data;
-            }
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("worker timed out");
-            }
-            thread::sleep(Duration::from_millis(2));
+    fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+        // SAFETY: the pipe owns this descriptor for both calls.
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(())
     }
-    fn wait(mut child: Child) -> Output {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("process timed out");
+
+    fn drain(pipe: Option<&mut impl Read>, data: &mut Vec<u8>) -> io::Result<bool> {
+        let Some(pipe) = pipe else {
+            return Ok(true);
+        };
+        let mut buffer = [0; 4096];
+        // Check the deadline even when a worker writes without stopping.
+        for _ in 0..16 {
+            match pipe.read(&mut buffer) {
+                Ok(0) => return Ok(true),
+                Ok(n) => data.extend_from_slice(&buffer[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             }
-            thread::sleep(Duration::from_millis(2));
         }
-        child.wait_with_output().unwrap()
+        Ok(false)
+    }
+
+    // Callers start each fixture in its own process group. Keep the deadline
+    // active until all pipes reach EOF, including after the main worker exits.
+    fn collect(
+        mut child: Child,
+        mut reader: Option<&mut File>,
+        timeout: Duration,
+    ) -> io::Result<(Vec<u8>, Output)> {
+        let result = (|| {
+            let deadline = Instant::now() + timeout;
+            if let Some(pipe) = &child.stdout {
+                nonblocking(pipe)?;
+            }
+            if let Some(pipe) = &child.stderr {
+                nonblocking(pipe)?;
+            }
+            let mut data = Vec::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            loop {
+                let progress_done = drain(reader.as_deref_mut(), &mut data)?;
+                let stdout_done = drain(child.stdout.as_mut(), &mut stdout)?;
+                let stderr_done = drain(child.stderr.as_mut(), &mut stderr)?;
+                // Keep the leader unreaped until EOF. Its PID then cannot be
+                // reused for another process group before timeout cleanup.
+                if progress_done && stdout_done && stderr_done {
+                    if let Some(status) = child.try_wait()? {
+                        return Ok((
+                            data,
+                            Output {
+                                status,
+                                stdout,
+                                stderr,
+                            },
+                        ));
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"));
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        })();
+        if result.is_err() {
+            // SAFETY: this group belongs to the fixture. Stop descendants too,
+            // since one can hold a pipe open after the group leader exits.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.wait();
+        }
+        result
+    }
+
+    fn run(command: &mut Command) -> io::Result<Output> {
+        let child = command.process_group(0).spawn()?;
+        collect(child, None, Duration::from_secs(10)).map(|(_, output)| output)
+    }
+
+    fn wait(command: &mut Command) -> Output {
+        run(command).unwrap()
     }
     fn capture(mode: &str) -> (Vec<u8>, Output) {
         let (mut reader, writer) = pipe();
@@ -116,10 +165,9 @@ mod suite {
                 Ok(())
             });
         }
-        let mut child = command.spawn().unwrap();
+        let child = command.process_group(0).spawn().unwrap();
         drop(writer);
-        let data = collect(&mut child, &mut reader);
-        let output = child.wait_with_output().unwrap();
+        let (data, output) = collect(child, Some(&mut reader), Duration::from_secs(10)).unwrap();
         assert!(
             output.status.success(),
             "mode {mode}: {}",
@@ -650,10 +698,54 @@ mod suite {
                     .success());
                 p.close().unwrap();
             }
+            "large-output" => {
+                use std::io::Write;
+                let p = options("large output").build().unwrap();
+                io::stdout().write_all(&vec![b'o'; 256 * 1024]).unwrap();
+                io::stderr().write_all(&vec![b'e'; 256 * 1024]).unwrap();
+                p.close().unwrap();
+            }
             "exit-23" => std::process::exit(23),
             "sleep" => thread::sleep(Duration::from_secs(30)),
             other => panic!("unknown worker {other}"),
         }
+    }
+
+    fn harness() {
+        // Output must be read while the worker runs, or a full pipe prevents exit.
+        let (data, output) = capture("large-output");
+        assert_eq!(frames(&data, 120)[0][0].name, "large output");
+        assert_eq!(output.stdout, vec![b'o'; 256 * 1024]);
+        assert_eq!(output.stderr, vec![b'e'; 256 * 1024]);
+
+        // Keep an extra writer open, as a descendant could do after its parent
+        // exits. Output collection must still stop at the deadline.
+        let (reader, writer) = pipe();
+        let mut child = worker_command("exit-23")
+            .process_group(0)
+            .stdout(Stdio::from(writer.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        child.stdout = Some(std::os::fd::OwnedFd::from(reader).into());
+        let start = Instant::now();
+        let error = collect(child, None, Duration::from_millis(25)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(writer);
+
+        // A timeout must terminate and reap a worker which is still running.
+        let child = worker_command("sleep").process_group(0).spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let error = collect(child, None, Duration::from_millis(25)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     fn basic() {
@@ -752,9 +844,7 @@ mod suite {
                 worker_command("invalid-env")
                     .env("ZIG_PROGRESS", value)
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap(),
+                    .stderr(Stdio::piped()),
             );
             assert!(
                 output.status.success(),
@@ -762,12 +852,7 @@ mod suite {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let output = wait(
-            worker_command("invalid-env")
-                .env_remove("ZIG_PROGRESS")
-                .spawn()
-                .unwrap(),
-        );
+        let output = wait(worker_command("invalid-env").env_remove("ZIG_PROGRESS"));
         assert!(output.status.success());
         let file = File::open("/dev/null").unwrap();
         let fd = file.as_raw_fd();
@@ -779,28 +864,23 @@ mod suite {
                 Ok(())
             });
         }
-        assert!(wait(command.spawn().unwrap()).status.success());
+        assert!(wait(&mut command).status.success());
         for mode in [
             "sigpipe",
             "sigpipe-ignored",
             "sigpipe-pending",
             "sigpipe-blocked",
         ] {
-            assert!(
-                wait(worker_command(mode).spawn().unwrap()).status.success(),
-                "{mode}"
-            );
+            assert!(wait(&mut worker_command(mode)).status.success(), "{mode}");
         }
     }
     fn zpg() {
-        let probe = Command::new("zpg")
+        let probe = run(Command::new("zpg")
             .arg("--help")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        if let Ok(child) = probe {
-            assert!(wait(child).status.success(), "zpg --help failed");
-        } else {
+            .stderr(Stdio::null()));
+        if let Err(error) = &probe {
+            assert_eq!(error.kind(), io::ErrorKind::NotFound, "zpg --help: {error}");
             assert!(
                 std::env::var_os("ZPRS_REQUIRE_ZPG").is_none(),
                 "zpg required but unavailable"
@@ -810,6 +890,7 @@ mod suite {
             );
             return;
         }
+        assert!(probe.unwrap().status.success(), "zpg --help failed");
         let directory = TempDir::new();
         for mode in [
             "basic",
@@ -830,7 +911,7 @@ mod suite {
                 .env_remove("ZIG_PROGRESS")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let output = wait(command.spawn().unwrap());
+            let output = wait(&mut command);
             let log = std::fs::read_to_string(&log_path).unwrap();
             let _ = std::fs::remove_file(log_path);
             assert!(
@@ -873,7 +954,8 @@ mod suite {
             return;
         }
         for (name, test) in [
-            ("wire formats", basic as fn()),
+            ("process test harness", harness as fn()),
+            ("wire formats", basic),
             ("spawn", spawn),
             ("fork", forks),
             ("limits and automatic updates", limits_and_updates),
