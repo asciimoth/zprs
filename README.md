@@ -1,5 +1,8 @@
 # zprs
 
+[![Crates.io](https://img.shields.io/crates/v/zprs.svg)](https://crates.io/crates/zprs)
+[![Documentation](https://img.shields.io/docsrs/zprs/latest)](https://docs.rs/zprs/)
+
 `zprs` is a Rust library that reports task progress through the Zig progress
 protocol. Use it to report tasks, subtasks, and progress from child processes.
 
