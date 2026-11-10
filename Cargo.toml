@@ -9,3 +9,11 @@ repository = "https://github.com/asciimoth/zprs"
 readme = "README.md"
 
 [dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[[test]]
+name = "processes"
+path = "tests/processes.rs"
+harness = false

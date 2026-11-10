@@ -7,6 +7,11 @@
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    zpg = {
+      url = "github:asciimoth/zpg";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.git-hooks.follows = "git-hooks";
+    };
   };
 
   outputs =
@@ -15,6 +20,7 @@
       nixpkgs,
       git-hooks,
       rust-overlay,
+      zpg,
       ...
     }:
     let
@@ -55,35 +61,60 @@
         let
           pkgs = pkgsFor system;
           toolchains = toolchainsFor pkgs;
+          cargoDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
+          };
+          cargoConfig = pkgs.writeText "zprs-cargo-config.toml" ''
+            [source.crates-io]
+            replace-with = "vendored-sources"
+            [source.vendored-sources]
+            directory = "${cargoDeps}"
+          '';
           rustHook = pkgs.writeShellApplication {
             name = "zprs-rust-hook";
             runtimeInputs = [
               toolchains.stable
               pkgs.stdenv.cc
               pkgs.just
+              zpg.packages.${system}.zpg
             ];
-            text = ''exec "$@"'';
+            text = ''
+              zprs_cargo_home=$(mktemp -d)
+              trap 'rm -rf "$zprs_cargo_home"' EXIT
+              cp ${cargoConfig} "$zprs_cargo_home/config.toml"
+              export CARGO_HOME="$zprs_cargo_home"
+              export ZPRS_REQUIRE_ZPG=1
+              "$@"
+            '';
           };
           checkRust =
             toolchain:
-            pkgs.runCommand "zprs-rust-${toolchain.version}-check"
+            (pkgs.makeRustPlatform {
+              cargo = toolchain;
+              rustc = toolchain;
+            }).buildRustPackage
               {
+                pname = "zprs-check";
+                version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+                cargoLock.lockFile = ./Cargo.lock;
                 nativeBuildInputs = [
-                  toolchain
-                  pkgs.stdenv.cc
                   pkgs.just
+                  zpg.packages.${system}.zpg
                 ];
                 src = pkgs.lib.cleanSource ./.;
-              }
-              ''
-                export HOME="$TMPDIR"
-                export CARGO_HOME="$TMPDIR/cargo-home"
-                cp -r "$src" source
-                chmod -R u+w source
-                cd source
-                just check-rust
-                touch "$out"
-              '';
+                buildPhase = ''
+                  runHook preBuild
+                  just build
+                  runHook postBuild
+                '';
+                checkPhase = ''
+                  runHook preCheck
+                  just lint-rust
+                  ZPRS_REQUIRE_ZPG=1 just test
+                  runHook postCheck
+                '';
+                installPhase = ''touch "$out"'';
+              };
         in
         {
           rust = checkRust toolchains.stable;
@@ -147,6 +178,7 @@
                 toolchain
                 pkgs.just
                 pkgs.rust-analyzer
+                zpg.packages.${system}.zpg
               ]
               ++ hook.enabledPackages;
               RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
