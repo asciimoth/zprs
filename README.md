@@ -183,16 +183,21 @@ reserved values, and truncated packets. The implementation also uses
 ## Examples and tests
 
 ```sh
+just run
+just run fork
 cargo build --examples
-zpg --renderer tree target/debug/examples/demo
-zpg --renderer tree target/debug/examples/fork
+zpg target/debug/examples/demo
+zpg target/debug/examples/fork
 cargo test --frozen
 cargo clippy --frozen --all-targets --all-features -- -D warnings
 cargo doc --frozen --no-deps
 ```
 
-The demo runs a Rust worker and `zpg --mock` at the same time. The fork example
-runs a Rust worker without exec.
+`just run` builds the demo and runs it under the `zpg` tree renderer. On Unix,
+the demo starts a `zpg --mock` subprocess and forks a Rust worker without exec.
+The parent collects both progress trees and sends the merged tree to the
+supervisor. Each task ends when its child exits. `just run fork` runs the
+separate example with only a forked Rust worker.
 
 Tests cover both wire formats, malformed child streams, partial writes,
 backpressure, task lifetimes, capacity, concurrent updates, standard process

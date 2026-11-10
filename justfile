@@ -3,14 +3,16 @@ set dotenv-load
 default:
     @just --list
 
-# Run an example. Extra arguments go to the example.
+# Run an example under zpg. Extra arguments go to the example.
 [positional-arguments]
 run example="demo" *args:
     #!/usr/bin/env bash
     set -euo pipefail
     example="$1"
     shift
-    cargo run --frozen --example "$example" -- "$@"
+    target_dir="${CARGO_TARGET_DIR:-target}"
+    cargo build --frozen --example "$example" --target-dir "$target_dir"
+    exec zpg "$target_dir/debug/examples/$example" "$@"
 
 # Run unit, integration, and documentation tests. Extra arguments go to Cargo.
 [positional-arguments]
